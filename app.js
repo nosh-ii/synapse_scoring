@@ -1,372 +1,500 @@
-// Synapse v1.0 — main app logic (BOA light theme)
-// Auth0 config (from you)
-const AUTH0_DOMAIN = "synapse.ca.auth0.com";
-const AUTH0_CLIENT_ID = "CwHqV2oGQEDbNUvjJrQzF63DwTrAYNHJ";
-const CALLBACK_URL = "https://nosh-ii.github.io/synapse_scoring/";
+// Synapse v1.0 — Trello-style card UI (client-side only)
+// No auth, local-first. Drop into same folder as index.html/styles.css
+
+// Config
+const STORAGE_KEY = 'synapse_v1_data';
+const DEFAULT_FINALS = 5;
+const PENALTY_PER_VIOLATION = 0.75; // negative (subtract) per violation
 
 // DOM refs
-const bandsBody = document.getElementById('bandsBody');
-const finalsBody = document.getElementById('finalsBody');
-const finalsX = document.getElementById('finalsX');
-const addBandBtn = document.getElementById('addBand');
-const exportBtn = document.getElementById('exportBtn');
-const importBtn = document.getElementById('importBtn');
+const cardsContainer = document.getElementById('cardsContainer');
+const detailPanel = document.getElementById('detailPanel');
+const addBandBtn = document.getElementById('addBandBtn');
+const finalsXInput = document.getElementById('finalsX');
+const finalsCountDisplay = document.getElementById('finalsCountDisplay');
+const finalsList = document.getElementById('finalsList');
+const exportJSONBtn = document.getElementById('exportJSON');
+const importJSONBtn = document.getElementById('importJSONBtn');
+const filePicker = document.getElementById('filePicker');
+const exportCSVBtn = document.getElementById('exportCSV');
 const clearBtn = document.getElementById('clearBtn');
-const workspaceSelect = document.getElementById('workspaceSelect');
-const newWorkspaceBtn = document.getElementById('newWorkspaceBtn');
-const renameWorkspaceBtn = document.getElementById('renameWorkspaceBtn');
-const deleteWorkspaceBtn = document.getElementById('deleteWorkspaceBtn');
-const loginBtn = document.getElementById('loginBtn');
-const logoutBtn = document.getElementById('logoutBtn');
-const guestBtn = document.getElementById('guestBtn');
-const userLabel = document.getElementById('userLabel');
-const exportCSVLink = document.getElementById('exportCSV');
+const searchInput = document.getElementById('searchInput');
 
-// state
-let auth0 = null;
-let isAuthenticated = false;
-let user = null;
-let state = { bands: [], finalX: 5 };
-let currentWorkspace = 'default_guest'; // default guest workspace key
+// State
+let state = {
+  finalsX: DEFAULT_FINALS,
+  bands: [] // each band: { id, name, city, cls, ge1,ge2,ge3, vpi,vpe, mpi,mpe, violations, manualPenalty }
+};
+let cardEls = new Map(); // id -> element
+let selectedId = null;
 
 // Helpers
+const uid = () => Math.random().toString(36).slice(2,9);
 const num = v => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-const uidKey = u => `synapse_${u}`;
-
-// --- Auth0 Integration (CDN createAuth0Client is available) ---
-async function initAuth() {
-  try {
-    auth0 = await createAuth0Client({
-      domain: AUTH0_DOMAIN,
-      client_id: AUTH0_CLIENT_ID,
-      authorizationParams: { redirect_uri: CALLBACK_URL },
-      cacheLocation: 'localstorage',
-      useRefreshTokens: true
-    });
-
-    // Handle redirect callback if present
-    if (window.location.search.includes('code=') && window.location.search.includes('state=')) {
-      try { await auth0.handleRedirectCallback(); } catch(e) { console.warn('Callback handling error', e); }
-      window.history.replaceState({}, document.title, CALLBACK_URL);
-    }
-
-    isAuthenticated = await auth0.isAuthenticated();
-    if (isAuthenticated) { user = await auth0.getUser(); onLogin(); }
-    else { updateAuthUI(); loadWorkspaceFromStorage(); }
-  } catch (err) { console.error('Auth init error', err); updateAuthUI(); loadWorkspaceFromStorage(); }
-}
-
-function updateAuthUI() {
-  if (isAuthenticated && user) {
-    userLabel.textContent = `Signed in as ${user.name || user.email}`;
-    loginBtn.style.display = 'none';
-    logoutBtn.style.display = 'inline-block';
-    guestBtn.style.display = 'none';
+const save = () => localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+const load = () => {
+  const raw = localStorage.getItem(STORAGE_KEY);
+  if (raw) {
+    try { state = JSON.parse(raw); } catch(e){ console.warn('Load parse err', e); }
   } else {
-    userLabel.textContent = 'Not signed in';
-    loginBtn.style.display = 'inline-block';
-    logoutBtn.style.display = 'none';
-    guestBtn.style.display = 'inline-block';
+    // seed sample
+    state.bands = [
+      { id: uid(), name:'Catawba Ridge HS', city:'Fort Mill, SC', cls:'5A', ge1:18, ge2:17, ge3:19, vpi:9, vpe:9, mpi:9, mpe:9, violations:0, manualPenalty:0 },
+      { id: uid(), name:'Fort Mill HS', city:'Fort Mill, SC', cls:'5A', ge1:16, ge2:16, ge3:15, vpi:8, vpe:8, mpi:8, mpe:8, violations:1, manualPenalty:0 },
+      { id: uid(), name:'Nation Ford HS', city:'Fort Mill, SC', cls:'4A', ge1:15, ge2:14, ge3:15, vpi:7, vpe:7, mpi:7, mpe:7, violations:0, manualPenalty:0 }
+    ];
+    state.finalsX = DEFAULT_FINALS;
+    save();
   }
+};
+
+// Scoring
+function computeBandTotals(b){
+  const ge = num(b.ge1) + num(b.ge2) + num(b.ge3); // 0-60
+  const visual = num(b.vpi) + num(b.vpe); // 0-20
+  const music = num(b.mpi) + num(b.mpe); // 0-20
+  const violations = Math.max(0, Math.floor(num(b.violations || 0)));
+  const penalty = (num(b.manualPenalty) && num(b.manualPenalty) !== 0) ? num(b.manualPenalty) : (violations * PENALTY_PER_VIOLATION);
+  const total = Math.round((ge + visual + music - penalty) * 100) / 100;
+  return { ge, visual, music, penalty, total, violations };
 }
 
-async function login() {
-  if (!auth0) return alert('Auth not initialized');
-  await auth0.loginWithRedirect({ authorizationParams: { redirect_uri: CALLBACK_URL } });
-}
-
-async function logout() {
-  if (!auth0) return;
-  await auth0.logout({ logoutParams: { returnTo: CALLBACK_URL } });
-  // after logout, reset to guest workspace
-  isAuthenticated = false; user = null;
-  currentWorkspace = 'default_guest'; loadWorkspaceFromStorage(); updateAuthUI();
-}
-
-async function onLogin() {
-  isAuthenticated = true;
-  user = await auth0.getUser();
-  // set workspace to user-specific default
-  currentWorkspace = uidKey(user.sub) + '_default';
-  // migrate guest data if any
-  migrateGuestToUser();
-  updateWorkspaceList();
-  loadWorkspaceFromStorage();
-  updateAuthUI();
-}
-
-// --- Storage & Workspaces ---
-function storageKeyForWorkspace(ws) { return `synapse_workspace::${ws}`; }
-
-function saveState() {
-  try { localStorage.setItem(storageKeyForWorkspace(currentWorkspace), JSON.stringify(state)); } catch(e) { console.warn('Save failed', e); }
-}
-
-function loadWorkspaceFromStorage() {
-  const raw = localStorage.getItem(storageKeyForWorkspace(currentWorkspace));
-  if (raw) state = JSON.parse(raw);
-  else state = { bands: [], finalX: Number(finalsX.value) || 5 };
-  state.bands = state.bands || [];
-  state.finalX = state.finalX || Number(finalsX.value) || 5;
-  renderAllRows();
-  recalcAndApplyRanks();
-  updateWorkspaceList();
-}
-
-function updateWorkspaceList() {
-  const keys = Object.keys(localStorage).filter(k => k.startsWith('synapse_workspace::'));
-  workspaceSelect.innerHTML = '';
-  if (!keys.includes(storageKeyForWorkspace(currentWorkspace))) {
-    localStorage.setItem(storageKeyForWorkspace(currentWorkspace), JSON.stringify(state));
-    keys.push(storageKeyForWorkspace(currentWorkspace));
+function computeAllRanks(){
+  // compute totals
+  state.bands.forEach(b => b._c = computeBandTotals(b));
+  // sort descending by total, highest first
+  const sorted = state.bands.slice().sort((a,b)=> b._c.total - a._c.total);
+  // competition ranking: 1,2,2,4 (standard competition ranking)
+  let prev = null, rank = 0, count = 0;
+  for (let i=0;i<sorted.length;i++){
+    count++;
+    if (prev === null || sorted[i]._c.total !== prev) {
+      rank = count;
+      prev = sorted[i]._c.total;
+    }
+    sorted[i]._c.rank = rank;
   }
-  keys.forEach(k => {
-    const opt = document.createElement('option');
-    opt.value = k.replace('synapse_workspace::','');
-    opt.textContent = opt.value.replace(uidKey(''),'').replace(/_/g,' ');
-    if (opt.value === currentWorkspace) opt.selected = true;
-    workspaceSelect.appendChild(opt);
+  // apply ranks back to state
+  sorted.forEach(s => {
+    const band = state.bands.find(b => b.id === s.id);
+    if (band) band._c.rank = s._c.rank;
   });
 }
 
-function createNewWorkspace() {
-  const name = prompt('New workspace name (no slashes):');
-  if (!name) return;
-  const owner = isAuthenticated && user ? uidKey(user.sub) : 'guest';
-  const key = owner + '_' + name.replace(/\s+/g,'_');
-  currentWorkspace = key;
-  state = { bands: [], finalX: Number(finalsX.value) || 5 };
-  saveState(); updateWorkspaceList(); renderAllRows(); recalcAndApplyRanks();
-}
+// UI rendering (create card once, then update)
+function createCardElement(b){
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.draggable = true;
+  el.dataset.id = b.id;
 
-function renameWorkspace() {
-  const newName = prompt('New workspace name:');
-  if (!newName) return;
-  const newKey = (currentWorkspace.split('_')[0]) + '_' + newName.replace(/\s+/g,'_');
-  const raw = localStorage.getItem(storageKeyForWorkspace(currentWorkspace));
-  if (raw) { localStorage.setItem(storageKeyForWorkspace(newKey), raw); localStorage.removeItem(storageKeyForWorkspace(currentWorkspace)); currentWorkspace = newKey; updateWorkspaceList(); }
-}
+  const left = document.createElement('div'); left.className = 'left';
+  const h4 = document.createElement('h4'); h4.textContent = b.name || 'Unnamed Band';
+  const meta = document.createElement('div'); meta.className = 'meta'; meta.textContent = `${b.city || ''} · ${b.cls || ''}`;
+  const scores = document.createElement('div'); scores.className = 'scores';
+  const pillTotal = document.createElement('div'); pillTotal.className = 'pill total-pill'; pillTotal.textContent = 'Total: 0.00';
+  const pillGE = document.createElement('div'); pillGE.className = 'pill'; pillGE.textContent = 'GE: 0';
+  const pillVis = document.createElement('div'); pillVis.className = 'pill'; pillVis.textContent = 'VIS: 0';
+  const pillMus = document.createElement('div'); pillMus.className = 'pill'; pillMus.textContent = 'MUS: 0';
+  scores.append(pillTotal, pillGE, pillVis, pillMus);
 
-function deleteWorkspace() {
-  if (!confirm('Delete current workspace? This cannot be undone.')) return;
-  localStorage.removeItem(storageKeyForWorkspace(currentWorkspace));
-  currentWorkspace = 'default_guest';
-  loadWorkspaceFromStorage();
-}
+  left.append(h4, meta, scores);
 
-function migrateGuestToUser() {
-  try {
-    const guestRaw = localStorage.getItem(storageKeyForWorkspace('default_guest'));
-    if (!guestRaw) return;
-    const userKey = uidKey(user.sub) + '_default';
-    const userRaw = localStorage.getItem(storageKeyForWorkspace(userKey));
-    if (!userRaw) { localStorage.setItem(storageKeyForWorkspace(userKey), guestRaw); }
-  } catch(e){ console.warn('migrate error', e); }
-}
+  const actions = document.createElement('div'); actions.className = 'actions';
+  const editBtn = document.createElement('button'); editBtn.textContent = 'Edit';
+  const delBtn = document.createElement('button'); delBtn.textContent = 'Delete';
+  const rankDiv = document.createElement('div'); rankDiv.className = 'rank-badge'; rankDiv.textContent = '#';
+  actions.append(editBtn, delBtn, rankDiv);
 
-// --- Scoring logic ---
-function computeBand(b) {
-  const ge = num(b.ge1)+num(b.ge2)+num(b.ge3);
-  const visual = num(b.vpi)+num(b.vpe);
-  const music = num(b.mpi)+num(b.mpe);
-  const penalty = num(b.penalty);
-  const total = Math.round((ge + visual + music - penalty) * 100)/100;
-  return { ge, visual, music, penalty, total };
-}
-
-function recalcRanks() {
-  state.bands.forEach(b => b._computed = computeBand(b));
-  const arr = state.bands.map((b,i)=>({i,tot:b._computed.total})).sort((a,b)=> b.tot - a.tot);
-  arr.forEach((it, idx) => { state.bands[it.i]._computed.overall = idx+1; });
-  const byClass = {};
-  arr.forEach(it => { const cls = state.bands[it.i].cls || 'Unknown'; byClass[cls] = byClass[cls] || []; byClass[cls].push(it); });
-  Object.keys(byClass).forEach(cls => { byClass[cls].forEach((it, idx) => state.bands[it.i]._computed.classRank = idx+1); });
-}
-
-// --- Table rendering & per-input updates (no full rerender on input) ---
-function createRow(i) {
-  const b = state.bands[i];
-  const tr = document.createElement('tr');
-  tr.dataset.i = i;
-  tr.innerHTML = `
-    <td><input class="input name" data-field="name" type="text" value="${escapeHtml(b.name||'')}" /></td>
-    <td><input class="input city" data-field="city" type="text" value="${escapeHtml(b.city||'')}" /></td>
-    <td><select class="input cls" data-field="cls">${classOptions(b.cls)}</select></td>
-    <td><input class="input ge1" data-field="ge1" type="number" min="0" max="20" value="${b.ge1||0}" /></td>
-    <td><input class="input ge2" data-field="ge2" type="number" min="0" max="20" value="${b.ge2||0}" /></td>
-    <td><input class="input ge3" data-field="ge3" type="number" min="0" max="20" value="${b.ge3||0}" /></td>
-    <td class="calc geCell"></td>
-    <td><input class="input vpi" data-field="vpi" type="number" min="0" max="10" value="${b.vpi||0}" /></td>
-    <td><input class="input vpe" data-field="vpe" type="number" min="0" max="10" value="${b.vpe||0}" /></td>
-    <td class="calc visualCell"></td>
-    <td><input class="input mpi" data-field="mpi" type="number" min="0" max="10" value="${b.mpi||0}" /></td>
-    <td><input class="input mpe" data-field="mpe" type="number" min="0" max="10" value="${b.mpe||0}" /></td>
-    <td class="calc musicCell"></td>
-    <td><input class="input penalty" data-field="penalty" type="number" value="${b.penalty||0}" /></td>
-    <td class="calc totalCell"></td>
-    <td class="rank overallCell"></td>
-    <td class="rank classCell"></td>
-    <td><button class="delBtn" title="Delete">✕</button></td>
-  `;
+  el.append(left, actions);
 
   // listeners
-  tr.querySelectorAll('input.input, select.input').forEach(inp => {
-    inp.addEventListener('input', (e) => {
-      const field = inp.dataset.field;
-      const ri = Number(tr.dataset.i);
-      if (inp.tagName.toLowerCase() === 'select') state.bands[ri][field] = inp.value;
-      else if (inp.type === 'number') state.bands[ri][field] = inp.value === '' ? 0 : Number(inp.value);
-      else state.bands[ri][field] = inp.value;
-      state.bands[ri]._computed = computeBand(state.bands[ri]);
-      updateComputedCellsForRow(ri);
-      recalcAndApplyRanks();
-      saveState();
-    }, {passive:true});
+  editBtn.addEventListener('click', ()=> selectBand(b.id));
+  delBtn.addEventListener('click', ()=>{
+    if (!confirm(`Delete band "${b.name}"?`)) return;
+    state.bands = state.bands.filter(x=>x.id!==b.id);
+    save();
+    removeCard(b.id);
+    if (selectedId === b.id) clearDetail();
+    computeAllRanks(); updateAllDisplays();
   });
 
-  tr.querySelector('.delBtn').addEventListener('click', () => {
-    const idx = Number(tr.dataset.i);
-    state.bands.splice(idx,1);
-    renderAllRows();
-    recalcAndApplyRanks();
-    saveState();
+  // drag and drop reorder
+  el.addEventListener('dragstart', (e)=>{
+    e.dataTransfer.setData('text/plain', b.id);
+    el.classList.add('dragging');
+  });
+  el.addEventListener('dragend', ()=> el.classList.remove('dragging'));
+  el.addEventListener('dragover', (e)=> e.preventDefault());
+  el.addEventListener('drop', (e)=>{
+    e.preventDefault();
+    const draggedId = e.dataTransfer.getData('text/plain');
+    if (!draggedId) return;
+    if (draggedId === b.id) return;
+    reorderBands(draggedId, b.id);
   });
 
-  return tr;
+  // store references inside element
+  el._refs = { title:h4, meta, pillTotal, pillGE, pillVis, pillMus, rankDiv };
+
+  return el;
 }
 
-function escapeHtml(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-
-function classOptions(selected) { 
-  const opts = ['1A','2A','3A','4A','5A','6A'];
-  return opts.map(o => `<option value="${o}" ${o===selected?'selected':''}>${o}</option>`).join('');
+function appendCard(b){
+  const el = createCardElement(b);
+  cardEls.set(b.id, el);
+  cardsContainer.appendChild(el);
+  updateCardDisplay(b);
 }
 
-function updateComputedCellsForRow(i) {
-  const tr = bandsBody.querySelector(`tr[data-i="${i}"]`);
-  if (!tr) return;
-  const c = state.bands[i]._computed || computeBand(state.bands[i]);
-  tr.querySelector('.geCell').textContent = c.ge;
-  tr.querySelector('.visualCell').textContent = c.visual;
-  tr.querySelector('.musicCell').textContent = c.music;
-  tr.querySelector('.totalCell').textContent = c.total.toFixed(2);
-  tr.querySelector('.overallCell').textContent = c.overall || '';
-  tr.querySelector('.classCell').textContent = c.classRank || '';
-  const finalN = Number(state.finalX) || 0;
-  if (finalN > 0 && Number(c.overall) <= finalN) tr.classList.add('final-row'); else tr.classList.remove('final-row');
+function removeCard(id){
+  const el = cardEls.get(id);
+  if (el && el.parentNode) el.parentNode.removeChild(el);
+  cardEls.delete(id);
 }
 
-function recalcAndApplyRanks() {
-  recalcRanks();
-  for (let i=0;i<state.bands.length;i++) updateComputedCellsForRow(i);
-  renderFinals();
+function reorderBands(draggedId, targetId){
+  const idxFrom = state.bands.findIndex(b=>b.id===draggedId);
+  const idxTo = state.bands.findIndex(b=>b.id===targetId);
+  if (idxFrom < 0 || idxTo < 0) return;
+  const [item] = state.bands.splice(idxFrom,1);
+  state.bands.splice(idxTo,0,item);
+  save();
+  renderCards(); computeAllRanks(); updateAllDisplays();
 }
 
-function renderAllRows() {
-  bandsBody.innerHTML = '';
-  for (let i=0;i<state.bands.length;i++) {
-    const tr = createRow(i);
-    bandsBody.appendChild(tr);
-    state.bands[i]._computed = computeBand(state.bands[i]);
-    updateComputedCellsForRow(i);
+function updateCardDisplay(b){
+  const el = cardEls.get(b.id);
+  if (!el) return;
+  const refs = el._refs;
+  refs.title.textContent = b.name || 'Unnamed Band';
+  refs.meta.textContent = `${b.city || ''} · ${b.cls || ''}`;
+  const c = b._c || computeBandTotals(b);
+  refs.pillTotal.textContent = `Total: ${c.total.toFixed(2)}`;
+  refs.pillGE.textContent = `GE ${c.ge}`;
+  refs.pillVis.textContent = `VIS ${c.visual}`;
+  refs.pillMus.textContent = `MUS ${c.music}`;
+  refs.rankDiv.textContent = `#${b._c && b._c.rank ? b._c.rank : ''}`;
+  // highlight finalists
+  const finalsX = Number(state.finalsX || 0);
+  if (finalsX > 0 && c.rank && c.rank <= finalsX) {
+    el.classList.add('final-row-style');
+  } else {
+    el.classList.remove('final-row-style');
   }
 }
 
-function renderFinals() {
-  finalsBody.innerHTML = '';
-  const finalN = Number(state.finalX) || 0;
-  const sorted = state.bands.slice().sort((a,b)=> b._computed.total - a._computed.total);
-  sorted.forEach((b, idx) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${b._computed.overall}</td><td>${escapeHtml(b.name)}</td><td>${escapeHtml(b.city)}</td><td>${escapeHtml(b.cls)}</td><td>${b._computed.total.toFixed(2)}</td><td>${b._computed.overall}</td>`;
-    if (finalN>0 && b._computed.overall <= finalN) tr.classList.add('final-row');
-    finalsBody.appendChild(tr);
+function renderCards(){
+  cardsContainer.innerHTML = '';
+  cardEls.clear();
+  for (const b of state.bands) appendCard(b);
+}
+
+// Detail panel: show form for selected band
+function selectBand(id){
+  selectedId = id;
+  const band = state.bands.find(b=>b.id===id);
+  if (!band) return;
+  detailPanel.classList.remove('empty');
+  detailPanel.innerHTML = '';
+  const container = document.createElement('div');
+
+  // header
+  const header = document.createElement('div'); header.style.display='flex'; header.style.justifyContent='space-between'; header.style.alignItems='center';
+  const title = document.createElement('h3'); title.textContent = band.name || 'Unnamed Band';
+  const saveNameBtn = document.createElement('button'); saveNameBtn.className='btn'; saveNameBtn.textContent='Save Name';
+  header.append(title, saveNameBtn);
+
+  // editable fields: name, city, class
+  const nameRow = document.createElement('div'); nameRow.className='form-row';
+  const nameLabel = document.createElement('label'); nameLabel.textContent='School name';
+  const nameInput = document.createElement('input'); nameInput.className='input'; nameInput.value = band.name || '';
+  nameRow.append(nameLabel, nameInput);
+
+  const cityRow = document.createElement('div'); cityRow.className='form-row';
+  const cityLabel = document.createElement('label'); cityLabel.textContent='City';
+  const cityInput = document.createElement('input'); cityInput.className='input'; cityInput.value = band.city || '';
+  cityRow.append(cityLabel, cityInput);
+
+  const classRow = document.createElement('div'); classRow.className='form-row';
+  const classLabel = document.createElement('label'); classLabel.textContent='Class';
+  const classSelect = document.createElement('select'); classSelect.className='input';
+  ['1A','2A','3A','4A','5A','6A'].forEach(opt=>{
+    const o = document.createElement('option'); o.value=o.textContent=opt;
+    if (band.cls===opt) o.selected=true;
+    classSelect.appendChild(o);
   });
+  classRow.append(classLabel, classSelect);
+
+  // GE section
+  const geSec = document.createElement('div'); geSec.className='section';
+  const geH = document.createElement('h4'); geH.textContent='General Effect (60)';
+  geSec.append(geH);
+  ['ge1','ge2','ge3'].forEach(k=>{
+    const row = document.createElement('div'); row.className='form-row';
+    const lab = document.createElement('label'); lab.textContent = `${k.toUpperCase()} (0–20)`;
+    const inp = document.createElement('input'); inp.type='number'; inp.min=0; inp.max=20; inp.className='input'; inp.value = band[k] || 0;
+    row.append(lab, inp);
+    geSec.append(row);
+    inp.addEventListener('input', ()=> { band[k] = Number(inp.value||0); band._c = computeBandTotals(band); computeAllRanks(); save(); updateCardDisplay(band); updateDetailTotals(); updateFinalsList(); });
+  });
+
+  // Visual
+  const visSec = document.createElement('div'); visSec.className='section';
+  const visH = document.createElement('h4'); visH.textContent='Visual (20)';
+  visSec.append(visH);
+  ['vpi','vpe'].forEach(k=>{
+    const row = document.createElement('div'); row.className='form-row';
+    const lab = document.createElement('label'); lab.textContent = `${k.toUpperCase()} (0–10)`;
+    const inp = document.createElement('input'); inp.type='number'; inp.min=0; inp.max=10; inp.className='input'; inp.value = band[k] || 0;
+    row.append(lab, inp);
+    visSec.append(row);
+    inp.addEventListener('input', ()=> { band[k] = Number(inp.value||0); band._c = computeBandTotals(band); computeAllRanks(); save(); updateCardDisplay(band); updateDetailTotals(); updateFinalsList(); });
+  });
+
+  // Music
+  const musSec = document.createElement('div'); musSec.className='section';
+  const musH = document.createElement('h4'); musH.textContent='Music (20)';
+  musSec.append(musH);
+  ['mpi','mpe'].forEach(k=>{
+    const row = document.createElement('div'); row.className='form-row';
+    const lab = document.createElement('label'); lab.textContent = `${k.toUpperCase()} (0–10)`;
+    const inp = document.createElement('input'); inp.type='number'; inp.min=0; inp.max=10; inp.className='input'; inp.value = band[k] || 0;
+    row.append(lab, inp);
+    musSec.append(row);
+    inp.addEventListener('input', ()=> { band[k] = Number(inp.value||0); band._c = computeBandTotals(band); computeAllRanks(); save(); updateCardDisplay(band); updateDetailTotals(); updateFinalsList(); });
+  });
+
+  // Penalties
+  const penSec = document.createElement('div'); penSec.className='section';
+  const penH = document.createElement('h4'); penH.textContent='Penalties / Timing';
+  penSec.append(penH);
+  const violRow = document.createElement('div'); violRow.className='form-row';
+  const violLabel = document.createElement('label'); violLabel.textContent='# Violations (× −0.75)';
+  const violInp = document.createElement('input'); violInp.type='number'; violInp.className='input'; violInp.min=0; violInp.value = band.violations || 0;
+  violRow.append(violLabel, violInp);
+  penSec.append(violRow);
+
+  const manualRow = document.createElement('div'); manualRow.className='form-row';
+  const manualLabel = document.createElement('label'); manualLabel.textContent='Manual penalty (points to subtract)';
+  const manualInp = document.createElement('input'); manualInp.type='number'; manualInp.className='input'; manualInp.value = band.manualPenalty || 0;
+  manualRow.append(manualLabel, manualInp);
+  penSec.append(manualRow);
+
+  // Total & actions
+  const totalBox = document.createElement('div'); totalBox.className = 'total-box';
+  const totalLeft = document.createElement('div'); totalLeft.innerHTML = '<div class="label-muted">Current subtotal</div>';
+  const totalRight = document.createElement('div'); totalRight.className = 'big'; totalRight.textContent = '0.00';
+  totalBox.append(totalLeft, totalRight);
+
+  const actionsBox = document.createElement('div'); actionsBox.style.display='flex'; actionsBox.style.gap='8px'; actionsBox.style.marginTop='10px';
+  const saveBtn = document.createElement('button'); saveBtn.className='btn primary'; saveBtn.textContent='Save';
+  const closeBtn = document.createElement('button'); closeBtn.className='btn'; closeBtn.textContent='Close';
+  actionsBox.append(saveBtn, closeBtn);
+
+  // wire inputs
+  nameInput.addEventListener('input', ()=> { band.name = nameInput.value; cardEls.get(band.id)._refs.title.textContent = band.name; save(); });
+  cityInput.addEventListener('input', ()=> { band.city = cityInput.value; cardEls.get(band.id)._refs.meta.textContent = `${band.city} · ${band.cls}`; save(); });
+  classSelect.addEventListener('change', ()=> { band.cls = classSelect.value; cardEls.get(band.id)._refs.meta.textContent = `${band.city} · ${band.cls}`; save(); });
+
+  violInp.addEventListener('input', ()=> { band.violations = Math.max(0, Math.floor(Number(violInp.value||0))); band._c = computeBandTotals(band); computeAllRanks(); save(); updateCardDisplay(band); updateDetailTotals(); updateFinalsList(); });
+  manualInp.addEventListener('input', ()=> { band.manualPenalty = Number(manualInp.value||0); band._c = computeBandTotals(band); computeAllRanks(); save(); updateCardDisplay(band); updateDetailTotals(); updateFinalsList(); });
+
+  saveBtn.addEventListener('click', ()=> {
+    // force compute & save
+    band._c = computeBandTotals(band);
+    computeAllRanks(); save();
+    updateCardDisplay(band);
+    updateAllDisplays();
+    alert('Saved.');
+  });
+  closeBtn.addEventListener('click', ()=> { clearDetail(); });
+
+  saveNameBtn.addEventListener('click', ()=> {
+    band.name = nameInput.value.trim() || band.name;
+    cardEls.get(band.id)._refs.title.textContent = band.name;
+    save();
+    title.textContent = band.name;
+  });
+
+  container.append(header, nameRow, cityRow, classRow, geSec, visSec, musSec, penSec, totalBox, actionsBox);
+  detailPanel.appendChild(container);
+
+  // initial totals update
+  band._c = computeBandTotals(band);
+  computeAllRanks();
+  updateAllDisplays();
+
+  function updateDetailTotals(){
+    const c = band._c || computeBandTotals(band);
+    totalRight.textContent = c.total.toFixed(2);
+    totalLeft.innerHTML = `<div class="label-muted">GE ${c.ge} · VIS ${c.visual} · MUSIC ${c.music} · Penalty ${c.penalty}</div>`;
+  }
+  updateDetailTotals();
 }
 
-// --- Row management ---
-function addBand() {
-  state.bands.push({name:'New Band', city:'City', cls:'4A', ge1:0,ge2:0,ge3:0, vpi:0,vpe:0, mpi:0,mpe:0, penalty:0});
-  saveState(); renderAllRows(); recalcAndApplyRanks();
+// clear detail panel
+function clearDetail(){
+  selectedId = null;
+  detailPanel.classList.add('empty');
+  detailPanel.innerHTML = '<div class="detail-empty">Select a band (or create a new one) to edit scores.</div>';
 }
 
-// --- Import/Export ---
-function exportJSON() {
-  const data = { state, workspace: currentWorkspace };
-  const blob = new Blob([JSON.stringify(data, null,2)], {type:'application/json'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `${currentWorkspace}_synapse.json`; a.click();
+// update displays for all cards and finals
+function updateAllDisplays(){
+  state.bands.forEach(b => {
+    b._c = computeBandTotals(b);
+  });
+  computeAllRanks();
+  // update cards
+  state.bands.forEach(b => updateCardDisplay(b));
+  // update finals list
+  updateFinalsList();
+  // save
+  save();
 }
 
-function importJSON(file) {
-  const reader = new FileReader();
-  reader.onload = (e) => {
+// finals list render
+function updateFinalsList(){
+  finalsList.innerHTML = '';
+  const finalsX = Number(state.finalsX || 0);
+  const sorted = state.bands.slice().sort((a,b)=> b._c.total - a._c.total);
+  // show top X then a separation for others
+  sorted.forEach((b, idx)=>{
+    const el = document.createElement('div');
+    el.className = 'final-item';
+    if (finalsX>0 && b._c.rank <= finalsX) el.classList.add('final');
+    el.innerHTML = `<div>${b._c.rank}. ${escapeHtml(b.name)} <small class="label-muted">(${b.cls})</small></div><div>${b._c.total.toFixed(2)}</div>`;
+    finalsList.appendChild(el);
+  });
+  finalsCountDisplay.textContent = finalsX;
+}
+
+// add band
+function addBand(){
+  const name = prompt('Band name:','New Band');
+  if (name === null) return;
+  const b = { id: uid(), name: name || 'New Band', city:'', cls:'4A', ge1:0, ge2:0, ge3:0, vpi:0, vpe:0, mpi:0, mpe:0, violations:0, manualPenalty:0 };
+  state.bands.push(b);
+  save();
+  appendCard(b);
+  computeAllRanks();
+  updateAllDisplays();
+  selectBand(b.id);
+}
+
+// remove all
+function clearAll(){
+  if (!confirm('Clear ALL bands and reset?')) return;
+  state.bands = [];
+  save();
+  renderCards();
+  clearDetail();
+  updateFinalsList();
+}
+
+// import/export
+function exportJSON(){
+  const blob = new Blob([JSON.stringify(state, null, 2)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'synapse_export.json'; a.click();
+}
+function importJSON(file){
+  const fr = new FileReader();
+  fr.onload = (e)=>{
     try {
       const parsed = JSON.parse(e.target.result);
-      if (parsed && parsed.state) state = parsed.state;
-      else if (Array.isArray(parsed)) state.bands = parsed;
-      saveState(); renderAllRows(); recalcAndApplyRanks();
-    } catch(err) { alert('Invalid JSON file'); }
+      if (parsed && Array.isArray(parsed.bands)) {
+        state = parsed;
+      } else if (Array.isArray(parsed)) {
+        state.bands = parsed;
+      } else if (parsed && parsed.bands) {
+        state = parsed;
+      } else {
+        alert('Invalid JSON format.');
+        return;
+      }
+      // ensure ids exist
+      state.bands = state.bands.map(b => ({ id: b.id || uid(), ...b }));
+      save();
+      renderCards();
+      computeAllRanks();
+      updateAllDisplays();
+      clearDetail();
+    } catch(err){
+      alert('Failed to import JSON: ' + err.message);
+    }
   };
-  reader.readAsText(file);
+  fr.readAsText(file);
 }
-
-// Export CSV (simple)
-function exportCSV() {
-  const rows = [['Band','City','Class','Total','Overall Rank','Class Rank']];
-  const sorted = state.bands.slice().sort((a,b)=> b._computed.total - a._computed.total);
-  sorted.forEach(b=> rows.push([b.name,b.city,b.cls,b._computed.total.toFixed(2),b._computed.overall,b._computed.classRank]));
-  const csv = rows.map(r=> r.map(c=> '"' + String(c).replace(/"/g,'""') + '"').join(',')).join('\\n');
+function exportCSV(){
+  const rows = [['Name','City','Class','GE','Visual','Music','Penalty','Total','Overall Rank','Violations']];
+  const sorted = state.bands.slice().sort((a,b)=> b._c.total - a._c.total);
+  sorted.forEach(b=>{
+    rows.push([b.name,b.city,b.cls,b._c.ge,b._c.visual,b._c.music,b._c.penalty,b._c.total,b._c.rank,b._c.violations]);
+  });
+  const csv = rows.map(r=> r.map(v=> `"${String(v||'').replace(/"/g,'""')}"`).join(',')).join('\n');
   const blob = new Blob([csv], {type:'text/csv'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'synapse_export.csv'; a.click();
+  const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='synapse_export.csv'; a.click();
 }
 
-// Clear all
-function clearAll() {
-  if (!confirm('Clear all bands?')) return;
-  state.bands = []; saveState(); renderAllRows(); recalcAndApplyRanks();
-}
+// util
+function escapeHtml(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
-// --- Utility UI wiring ---
-addBandBtn.addEventListener('click', addBand);
-exportBtn.addEventListener('click', exportJSON);
-document.getElementById('exportCSV').addEventListener('click', exportCSV);
-clearBtn.addEventListener('click', clearAll);
-finalsX.addEventListener('input', (e)=> { state.finalX = Number(e.target.value)||0; saveState(); recalcAndApplyRanks(); });
-newWorkspaceBtn.addEventListener('click', createNewWorkspace);
-renameWorkspaceBtn.addEventListener('click', renameWorkspace);
-deleteWorkspaceBtn.addEventListener('click', deleteWorkspace);
-workspaceSelect.addEventListener('change', (e)=> { currentWorkspace = e.target.value; loadWorkspaceFromStorage(); });
-
-exportBtn.addEventListener('click', () => { 
-  const input = document.createElement('input'); input.type='file'; input.accept='.json'; input.onchange = (ev) => { importJSON(ev.target.files[0]); }; input.click();
-});
-
-loginBtn.addEventListener('click', login);
-logoutBtn.addEventListener('click', logout);
-guestBtn.addEventListener('click', ()=> { isAuthenticated = false; user = null; currentWorkspace = 'default_guest'; loadWorkspaceFromStorage(); updateAuthUI(); });
-
-// --- Init sample/default ---
-function loadSampleIfEmpty() {
-  if (!state.bands || state.bands.length===0) {
-    state.bands = [
-      {name:'Catawba Ridge HS', city:'Fort Mill, SC', cls:'5A', ge1:18,ge2:17,ge3:19, vpi:9,vpe:9, mpi:9,mpe:9, penalty:0},
-      {name:'Fort Mill HS', city:'Fort Mill, SC', cls:'5A', ge1:16,ge2:16,ge3:15, vpi:8,vpe:8, mpi:8,mpe:8, penalty:1},
-      {name:'Nation Ford HS', city:'Fort Mill, SC', cls:'4A', ge1:15,ge2:14,ge3:15, vpi:7,vpe:7, mpi:7,mpe:7, penalty:0}
-    ];
-    saveState();
+// search filter
+function filterCards(){
+  const q = (searchInput.value || '').trim().toLowerCase();
+  for (const b of state.bands){
+    const el = cardEls.get(b.id);
+    if (!el) continue;
+    const txt = `${b.name} ${b.city} ${b.cls}`.toLowerCase();
+    el.style.display = q ? (txt.includes(q) ? '' : 'none') : '';
   }
 }
 
-function init() {
-  currentWorkspace = 'default_guest';
-  finalsX.value = state.finalX || 5;
-  loadWorkspaceFromStorage();
-  loadSampleIfEmpty();
-  renderAllRows();
-  recalcAndApplyRanks();
-  updateWorkspaceList();
-  initAuth();
+// init
+function init(){
+  load();
+  finalsXInput.value = state.finalsX || DEFAULT_FINALS;
+  finalsXInput.addEventListener('input', ()=> {
+    state.finalsX = Math.max(0, Number(finalsXInput.value || 0));
+    computeAllRanks(); updateAllDisplays();
+  });
+  addBandBtn.addEventListener('click', addBand);
+  exportJSONBtn.addEventListener('click', exportJSON);
+  importJSONBtn.addEventListener('click', ()=> filePicker.click());
+  filePicker.addEventListener('change', (e)=> {
+    if (e.target.files && e.target.files[0]) importJSON(e.target.files[0]);
+    filePicker.value = '';
+  });
+  exportCSVBtn.addEventListener('click', exportCSV);
+  clearBtn.addEventListener('click', clearAll);
+  searchInput.addEventListener('input', filterCards);
+
+  // initial render
+  renderCards();
+  computeAllRanks();
+  updateAllDisplays();
 }
 
-// Run
+// rendering current state -> ensure each band has card
+function appendCard(b){
+  if (cardEls.has(b.id)) {
+    updateCardDisplay(b);
+    return;
+  }
+  const el = createCardElement(b);
+  cardEls.set(b.id, el);
+  cardsContainer.appendChild(el);
+}
+
+// initial render function
+function renderCards(){
+  cardsContainer.innerHTML = '';
+  cardEls.clear();
+  for (const b of state.bands) {
+    appendCard(b);
+  }
+}
+
+// kick off
 init();
